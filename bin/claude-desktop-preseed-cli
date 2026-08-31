@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Preseed the Claude Code CLI binary that Claude Desktop (Linux beta) expects.
+#
+# Why: on aarch64 the app's own downloader dies before any network I/O --
+# its "make private dir" helper calls
+#   open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+# with the x86_64 numeric flag values. On aarch64 0o200000 is O_DIRECT, not
+# O_DIRECTORY, and O_DIRECT on a directory is always EINVAL. The UI reports it
+# as "No path to Claude code executable (Download failed. Check your internet
+# connection and try again.)", which is misleading -- the network is fine.
+#
+# This script does what the app would have done: reads the version + checksum
+# the installed app is pinned to, fetches that exact build, verifies it, and
+# drops it where the app looks. Re-run it after Claude Desktop updates.
+set -euo pipefail
+
+ASAR="${CLAUDE_DESKTOP_ASAR:-$HOME/.local/lib/claude-desktop/resources/app.asar}"
+STORE="${CLAUDE_DESKTOP_STORE:-$HOME/.config/Claude/claude-code}"
+
+[ -f "$ASAR" ] || { echo "error: app.asar not found at $ASAR" >&2; exit 1; }
+
+case "$(uname -m)" in
+  aarch64|arm64) PLAT=linux-arm64 ;;
+  x86_64)        PLAT=linux-x64 ;;
+  *) echo "error: unsupported machine $(uname -m)" >&2; exit 1 ;;
+esac
+
+# Pull the build-pinned version, base URL and per-platform checksum out of the app.
+read -r VERSION BASEURL CHECKSUM < <(ASAR="$ASAR" PLAT="$PLAT" python3 - <<'PY'
+import json, os, sys
+d = open(os.environ["ASAR"], "rb").read()
+i = d.find(b"function hh(){return JSON.parse(`")
+if i < 0:
+    sys.exit("error: version pin not found in app.asar (app layout changed?)")
+s = d.find(b"`", i + 30) + 1
+o = json.loads(d[s:d.find(b"`", s)].decode("utf8"))
+p = o["manifest"]["platforms"].get(os.environ["PLAT"])
+if not p:
+    sys.exit(f"error: {os.environ['PLAT']} not in manifest")
+print(o["version"], o["baseUrl"], p["checksum"])
+PY
+)
+
+DIR="$STORE/$VERSION"
+echo "pinned version : $VERSION ($PLAT)"
+echo "install dir    : $DIR"
+
+if [ -x "$DIR/claude" ] && [ "$(cat "$DIR/.verified" 2>/dev/null)" = "$CHECKSUM" ]; then
+  echo "already installed and verified - nothing to do"
+  exit 0
+fi
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+URL="$BASEURL/$VERSION/$PLAT/claude.zst"
+echo "downloading    : $URL"
+curl -fL --retry 3 -o "$TMP/claude.zst" "$URL"
+
+GOT=$(sha256sum "$TMP/claude.zst" | cut -d' ' -f1)
+[ "$GOT" = "$CHECKSUM" ] || { echo "error: checksum mismatch (got $GOT, want $CHECKSUM)" >&2; exit 1; }
+echo "checksum ok"
+
+zstd -q -d -f -o "$TMP/claude" "$TMP/claude.zst"
+PSHA=$(sha256sum "$TMP/claude" | cut -d' ' -f1)
+PSIZE=$(stat -c%s "$TMP/claude")
+
+mkdir -p "$DIR"; chmod 700 "$DIR"
+install -m 755 "$TMP/claude" "$DIR/claude"
+printf '%s' "$CHECKSUM" > "$DIR/.verified"; chmod 600 "$DIR/.verified"
+printf '{\n  "sha256": "%s",\n  "size": %s\n}' "$PSHA" "$PSIZE" > "$DIR/.payload"; chmod 600 "$DIR/.payload"
+
+echo "installed      : $("$DIR/claude" --version)"
+echo "restart Claude Desktop to pick it up."

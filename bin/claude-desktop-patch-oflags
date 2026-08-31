@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Fix Claude Desktop (Linux beta) on aarch64: O_DIRECTORY/O_NOFOLLOW flag values.
+
+The app's private-directory helper does
+
+    open(dir, fs.constants.O_RDONLY
+            | (fs.constants.O_DIRECTORY ?? 0)
+            | (fs.constants.O_NOFOLLOW  ?? 0))
+
+with the *x86_64* numeric values. On aarch64 x86_64's O_DIRECTORY (0o200000) is
+O_DIRECT, and O_DIRECT on a directory is always EINVAL -- so every subsystem
+that creates a private dir fails: the Claude Code CLI download (fatal, shown as
+"No path to Claude code executable / Download failed. Check your internet
+connection"), scheduled-task persistence, remote plugin sync, skills sync.
+
+This rewrites that expression, in place and byte-for-byte the same length, to
+the correct literal for THIS machine, so no asar offset or size changes.
+The helper keeps its symlink-race hardening (O_DIRECTORY + O_NOFOLLOW are
+preserved as values, not dropped).
+
+Because the replacement is the same length, V8 would happily reuse the
+precompiled bytecode in the archive's compile-cache -- V8 keys its source check
+on source *length*. So the matching .jsc header is zeroed to force a clean
+cachedDataRejected fallback to the patched source.
+
+Re-run after every Claude Desktop update; updates replace app.asar.
+Restore with:  cp app.asar.prepatch-<stamp> app.asar
+"""
+import json, os, re, shutil, struct, subprocess, sys, time
+
+ASAR = os.environ.get("CLAUDE_DESKTOP_ASAR",
+                      os.path.expanduser("~/.local/lib/claude-desktop/resources/app.asar"))
+
+# The expression as it appears, under any minified module alias.
+PATTERN = re.compile(
+    rb"([A-Za-z_$][\w$]*)\.constants\.O_RDONLY"
+    rb"\|\(\1\.constants\.O_DIRECTORY\?\?0\)"
+    rb"\|\(\1\.constants\.O_NOFOLLOW\?\?0\)"
+)
+MARKER = b"/*aarch64-oflag-patch*/"
+
+
+def die(msg):
+    sys.exit(f"error: {msg}")
+
+
+def asar_entries(blob):
+    hdr_size = struct.unpack("<I", blob[12:16])[0]
+    index = json.loads(blob[16:16 + hdr_size].decode("utf8"))
+    base = 16 + hdr_size
+
+    def walk(node, path=""):
+        for name, meta in node.get("files", {}).items():
+            p = f"{path}/{name}"
+            if "files" in meta:
+                yield from walk(meta, p)
+            elif meta.get("offset") is not None:
+                yield p, base + int(meta["offset"]), int(meta["size"])
+
+    return dict((p, (o, s)) for p, o, s in walk(index))
+
+
+def main():
+    if os.uname().machine not in ("aarch64", "arm64"):
+        die(f"this patch is for aarch64; this machine is {os.uname().machine}")
+    if not os.path.isfile(ASAR):
+        die(f"app.asar not found at {ASAR}")
+
+    running = subprocess.run(["pgrep", "-f", r"lib/claude-desktop/claude-desktop$"],
+                             capture_output=True).stdout.split()
+    if running:
+        die("Claude Desktop is running -- quit it first, then re-run this script")
+
+    blob = bytearray(open(ASAR, "rb").read())
+
+    if MARKER in blob:
+        print("already patched -- nothing to do")
+        return
+
+    hits = list(PATTERN.finditer(bytes(blob)))
+    if not hits:
+        die("flag expression not found; app layout changed -- re-derive the patch "
+            "before trusting this script")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    print(f"aarch64 O_RDONLY|O_DIRECTORY|O_NOFOLLOW = {flags} "
+          f"(0o{flags:o}); found {len(hits)} site(s)")
+
+    for m in hits:
+        span = m.end() - m.start()
+        repl = b"%d%s" % (flags, MARKER)
+        if len(repl) > span:
+            die("replacement longer than original; cannot patch in place")
+        repl += b" " * (span - len(repl))          # pad: trailing space is valid JS
+        assert len(repl) == span
+        blob[m.start():m.end()] = repl
+        print(f"  patched @ {m.start()} (alias {m.group(1).decode()}., {span} bytes)")
+
+    # Force V8 to recompile the chunk we edited instead of reusing its bytecode.
+    invalidated = 0
+    for path, (off, size) in asar_entries(bytes(blob)).items():
+        if path.startswith("/compile-cache/") and path.endswith(".jsc"):
+            if blob[off:off + 32] != bytes(32):
+                blob[off:off + 32] = bytes(32)     # kill the magic -> clean reject
+                invalidated += 1
+                print(f"  invalidated compile cache {path}")
+    if not invalidated:
+        print("  (no compile cache entries found)")
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = f"{ASAR}.prepatch-{stamp}"
+    shutil.copy2(ASAR, backup)
+    tmp = ASAR + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(blob)
+    shutil.copymode(ASAR, tmp)
+    os.replace(tmp, ASAR)
+
+    print(f"backup : {backup}")
+    print(f"patched: {ASAR}")
+    print("start Claude Desktop; EINVAL lines should be gone from "
+          "~/.config/Claude/logs/main.log")
+
+
+if __name__ == "__main__":
+    main()
