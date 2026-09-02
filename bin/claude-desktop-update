@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Update Claude Desktop (Linux beta) on aarch64/Asahi, end to end.
+#
+# The Linux beta's in-app updater is deliberately off ("updates via apt"), and on
+# Fedora Asahi there is no apt -- the app is a manual extraction of Anthropic's .deb
+# under ~/.local. This tool does what apt would: reads the update feed, fetches the
+# build-pinned .deb for this arch, verifies the size, extracts it, and swaps it into
+# place. Because an update replaces app.asar (reverting the aarch64 O_DIRECTORY fix)
+# and repins the Claude Code CLI, it then re-runs the two sibling tools:
+#   claude-desktop-patch-oflags   (re-applies the O_DIRECTORY/O_NOFOLLOW value fix)
+#   claude-desktop-preseed-cli    (fetches the newly-pinned CLI build)
+#
+# The app must be QUIT before the swap (patch-oflags refuses while it runs, and
+# overwriting a live install is unsafe). If you run this while Claude Desktop is up
+# -- e.g. from a terminal the app itself spawned -- it stages everything and stops,
+# so you can quit the app and finish with:  claude-desktop-update --apply
+#
+# Usage:
+#   claude-desktop-update            check, download, stage; apply if app is quit
+#   claude-desktop-update --check    show installed vs latest, then exit
+#   claude-desktop-update --stage    download + stage only, never swap
+#   claude-desktop-update --apply    finish a staged update (app must be quit)
+#   claude-desktop-update --force    reinstall even if already on the latest version
+#
+# Env overrides:
+#   CLAUDE_DESKTOP_ASAR    path to the installed app.asar (default ~/.local/lib/...)
+#   CLAUDE_DESKTOP_UPDATE_HOST   update-feed host (default https://api.anthropic.com;
+#                          set to https://releases.claude.com to avoid api.anthropic.com)
+set -euo pipefail
+
+ASAR="${CLAUDE_DESKTOP_ASAR:-$HOME/.local/lib/claude-desktop/resources/app.asar}"
+UPDATE_HOST="${CLAUDE_DESKTOP_UPDATE_HOST:-https://api.anthropic.com}"
+
+LIBDIR="$(dirname "$(dirname "$ASAR")")"   # .../claude-desktop
+PARENT="$(dirname "$LIBDIR")"              # .../lib
+NAME="$(basename "$LIBDIR")"               # claude-desktop
+STAGE="$PARENT/$NAME.new"
+WORK="$PARENT/.$NAME-update.work"          # same filesystem as target (atomic staging)
+
+MODE=auto            # auto | check | stage | apply
+FORCE=0
+for a in "$@"; do
+  case "$a" in
+    --check) MODE=check ;;
+    --stage|--stage-only) MODE=stage ;;
+    --apply) MODE=apply ;;
+    --force) FORCE=1 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+c_b=$'\033[1m'; c_r=$'\033[31m'; c_0=$'\033[0m'
+log(){ printf '%s==>%s %s\n' "$c_b" "$c_0" "$*"; }
+die(){ printf '%serror:%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
+app_running(){ pgrep -f 'lib/claude-desktop/claude-desktop$' >/dev/null 2>&1; }
+
+case "$(uname -m)" in
+  aarch64|arm64) ARCH=arm64 ;;
+  x86_64)        ARCH=x64 ;;
+  *) die "unsupported machine $(uname -m)" ;;
+esac
+
+for t in curl python3 dpkg-deb; do command -v "$t" >/dev/null || die "missing required tool: $t"; done
+
+# Resolve the two sibling tools (same bin dir first, then PATH).
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve(){ [ -x "$SELF_DIR/$1" ] && { echo "$SELF_DIR/$1"; return; }; command -v "$1" 2>/dev/null || return 1; }
+PATCH="$(resolve claude-desktop-patch-oflags)" || die "claude-desktop-patch-oflags not found"
+PRESEED="$(resolve claude-desktop-preseed-cli)" || die "claude-desktop-preseed-cli not found"
+
+installed_version(){
+  [ -f "$ASAR" ] || { echo "none"; return; }
+  python3 - "$ASAR" <<'PY'
+import re,sys
+d=open(sys.argv[1],'rb').read()
+m=re.search(rb'appVersion":"(\d+\.\d+\.\d+)',d)
+print(m.group(1).decode() if m else "unknown")
+PY
+}
+
+INSTALLED="$(installed_version)"
+FEED="$UPDATE_HOST/api/desktop/linux/$ARCH/deb/latest"
+log "Checking update feed ($ARCH): $FEED"
+JSON="$(curl -fsS "$FEED")" || die "could not reach update feed"
+LATEST="$(printf '%s' "$JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
+DEB_URL="$(printf '%s' "$JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["url"])')"
+[ -n "$LATEST" ] && [ -n "$DEB_URL" ] || die "malformed feed response: $JSON"
+
+echo "   installed : $INSTALLED"
+echo "   latest    : $LATEST"
+
+if [ "$MODE" = check ]; then
+  [ "$INSTALLED" = "$LATEST" ] && echo "up to date." || echo "update available."
+  exit 0
+fi
+
+# A staged tree already built for this exact latest version can be reused.
+staged_is_latest(){ [ -d "$STAGE" ] && grep -aoq "appVersion\":\"$LATEST" "$STAGE/resources/app.asar" 2>/dev/null; }
+
+if [ "$INSTALLED" = "$LATEST" ] && [ "$FORCE" -ne 1 ] && [ "$MODE" != apply ]; then
+  log "Already on the latest version -- nothing to do (use --force to reinstall)."
+  exit 0
+fi
+
+# ---- prep: download + extract + stage (skipped if a matching stage already exists) ----
+if staged_is_latest; then
+  log "Reusing staged tree: $STAGE ($LATEST)"
+else
+  rm -rf "$WORK" "$STAGE"; mkdir -p "$WORK"
+  trap 'rm -rf "$WORK"' EXIT
+  log "Downloading $LATEST .deb"
+  curl -fL --retry 3 -o "$WORK/claude.deb" "$DEB_URL"
+  EXPECT="$(curl -fsSI "$DEB_URL" | awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r')"
+  GOT="$(stat -c%s "$WORK/claude.deb")"
+  [ -z "$EXPECT" ] || [ "$EXPECT" = "$GOT" ] || die "download size mismatch (got $GOT, want $EXPECT)"
+  log "Extracting"
+  dpkg-deb -x "$WORK/claude.deb" "$WORK/payload"
+  NEWTREE="$WORK/payload/usr/lib/claude-desktop"
+  [ -d "$NEWTREE" ] || die "unexpected .deb layout: $NEWTREE missing"
+  grep -aoq "appVersion\":\"$LATEST" "$NEWTREE/resources/app.asar" || die "extracted app is not $LATEST"
+  chmod 0755 "$NEWTREE/chrome-sandbox" 2>/dev/null || true   # match prior user-local setup
+  mv "$NEWTREE" "$STAGE"
+  rm -rf "$WORK"; trap - EXIT
+  log "Staged: $STAGE"
+fi
+
+if [ "$MODE" = stage ]; then
+  echo
+  log "Staged only. Quit Claude Desktop, then finish with:  $(basename "$0") --apply"
+  exit 0
+fi
+
+# ---- the swap must happen with the app quit ----
+if app_running; then
+  if [ "$MODE" = apply ]; then
+    die "Claude Desktop is still running. Fully quit it (tray -> Quit) and re-run --apply."
+  fi
+  echo
+  log "Claude Desktop is running -- staged but not applied."
+  echo "   Finish from a normal terminal after quitting the app (tray icon -> Quit):"
+  echo "       $(basename "$0") --apply"
+  echo "   (If you started this from a terminal the app spawned, that terminal closes"
+  echo "    when the app quits -- open a fresh one, e.g. Konsole.)"
+  exit 0
+fi
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BAK="$PARENT/$NAME.bak-$STAMP"
+log "Backing up current install -> $BAK"
+mv "$LIBDIR" "$BAK"
+log "Installing $LATEST"
+if ! mv "$STAGE" "$LIBDIR"; then mv "$BAK" "$LIBDIR"; die "swap failed; restored previous install"; fi
+
+rollback(){ printf '%s!! failure after swap -- rolling back%s\n' "$c_r" "$c_0" >&2; rm -rf "$LIBDIR"; mv "$BAK" "$LIBDIR" && echo "restored previous install"; }
+trap rollback ERR
+
+log "Re-applying aarch64 O_DIRECTORY patch"
+"$PATCH"
+log "Ensuring pinned Claude Code CLI"
+"$PRESEED"
+trap - ERR
+
+grep -aoq "appVersion\":\"$LATEST" "$LIBDIR/resources/app.asar" || die "post-check: live app is not $LATEST"
+grep -aoq '/\*aarch64-oflag-patch\*/' "$LIBDIR/resources/app.asar" || die "post-check: O_DIRECTORY patch marker missing"
+
+echo
+log "Updated to $LATEST."
+echo "   backup at : $BAK"
+echo "   restart Claude Desktop to pick it up."
+echo "   roll back : rm -rf '$LIBDIR' && mv '$BAK' '$LIBDIR'"

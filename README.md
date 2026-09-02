@@ -2,11 +2,12 @@
 
 Fixes for **Claude Desktop for Linux (beta)** on **aarch64 / Apple Silicon (Asahi Linux)**.
 
-Two small, self-contained tools that patch or preseed **your own installed copy** of Claude
-Desktop. They do **not** redistribute any Anthropic software — `patch-oflags` edits the
-`app.asar` you already installed, in place; `preseed-cli` fetches the exact build-pinned Claude
-Code CLI from Anthropic's own servers with sha256 verification. No Anthropic code is included in
-this repository.
+Three small, self-contained tools that update, patch, or preseed **your own installed copy** of
+Claude Desktop. They do **not** redistribute any Anthropic software — `update` fetches the
+build-pinned `.deb` from Anthropic's own update feed and swaps it into your user-local install;
+`patch-oflags` edits the `app.asar` you already installed, in place; `preseed-cli` fetches the
+exact build-pinned Claude Code CLI from Anthropic's own servers with sha256 verification. No
+Anthropic code is included in this repository.
 
 > Not affiliated with or endorsed by Anthropic. Use on software you have already installed and
 > are licensed to run.
@@ -28,6 +29,30 @@ flag constant is wrong for the architecture. (Reported upstream; these let you r
 meantime, and after each app update, which replaces `app.asar`.)
 
 ## Tools
+
+### `bin/claude-desktop-update`
+One-shot updater for the whole app, so you don't have to drive the two tools below by hand. The
+Linux beta's in-app updater is off by design (it logs *"updates via apt"*), and Fedora Asahi has
+no apt — so this does what apt would: reads Anthropic's update feed, fetches the build-pinned
+`.deb` for this architecture, verifies its size, extracts it, and swaps it into your user-local
+install (`~/.local/lib/claude-desktop`). Because an update replaces `app.asar` (reverting the
+O_DIRECTORY fix) and repins the Claude Code CLI, it then re-runs `patch-oflags` and `preseed-cli`
+for you. It keeps a timestamped backup and rolls back on failure.
+
+Quit Claude Desktop before applying — `patch-oflags` refuses while it runs, and overwriting a
+live install is unsafe. If you run it while the app is up (e.g. from a terminal the app itself
+spawned), it stages everything and stops, so you can quit the app and finish from a fresh
+terminal with `--apply`.
+
+```sh
+claude-desktop-update          # check + download + stage; applies if the app is already quit
+claude-desktop-update --check  # just show installed vs latest, then exit
+claude-desktop-update --stage  # download + stage only, never swap
+claude-desktop-update --apply  # finish a staged update (run after quitting the app)
+```
+
+To read the feed from `releases.claude.com` instead of `api.anthropic.com` (e.g. if the latter is
+blocked), set `CLAUDE_DESKTOP_UPDATE_HOST=https://releases.claude.com`.
 
 ### `bin/claude-desktop-patch-oflags`
 Rewrites that flag expression **in place and byte-for-byte the same length** to the correct
