@@ -125,6 +125,19 @@ else
   log "Staged: $STAGE"
 fi
 
+# ---- pre-validate the staged build BEFORE touching the live install ----
+# Both sibling tools accept CLAUDE_DESKTOP_ASAR, so they can vet the staged
+# app.asar while the current app keeps running. An unrecognised layout aborts
+# here, with the stage left intact for inspection, instead of after a swap.
+STAGE_ASAR="$STAGE/resources/app.asar"
+log "Pre-validating staged build"
+OFLAGS="$(CLAUDE_DESKTOP_ASAR="$STAGE_ASAR" "$PATCH" --check)" \
+  || die "staged app.asar has an unrecognised layout ($OFLAGS); re-derive the patch before applying (stage kept at $STAGE)"
+echo "   O_DIRECTORY status : $OFLAGS"
+# Also fetches the CLI this build pins, so the post-swap preseed is a no-op.
+CLAUDE_DESKTOP_ASAR="$STAGE_ASAR" "$PRESEED" \
+  || die "could not preseed the CLI pinned by the staged build (stage kept at $STAGE)"
+
 if [ "$MODE" = stage ]; then
   echo
   log "Staged only. Quit Claude Desktop, then finish with:  $(basename "$0") --apply"
@@ -162,7 +175,9 @@ log "Ensuring pinned Claude Code CLI"
 trap - ERR
 
 grep -aoq "appVersion\":\"$LATEST" "$LIBDIR/resources/app.asar" || die "post-check: live app is not $LATEST"
-grep -aoq '/\*aarch64-oflag-patch\*/' "$LIBDIR/resources/app.asar" || die "post-check: O_DIRECTORY patch marker missing"
+# Builds >= 1.44121 carry the upstream fix and are never patched, so accept either state.
+CLAUDE_DESKTOP_ASAR="$LIBDIR/resources/app.asar" "$PATCH" --check | grep -qE '^(already-patched|upstream-fixed)' \
+  || die "post-check: live app is neither patched nor upstream-fixed"
 
 echo
 log "Updated to $LATEST."

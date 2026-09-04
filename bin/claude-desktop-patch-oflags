@@ -23,6 +23,17 @@ precompiled bytecode in the archive's compile-cache -- V8 keys its source check
 on source *length*. So the matching .jsc header is zeroed to force a clean
 cachedDataRejected fallback to the patched source.
 
+Upstream fixed this in Claude Desktop >= 1.44121: the app now carries a
+per-architecture constants table and corrects fs.constants itself whenever the
+runtime's values don't match process.arch. On such builds there is nothing to
+patch, and this script says so and exits 0 -- so an updater can run it
+unconditionally after every update.
+
+    claude-desktop-patch-oflags            # patch (quit Claude Desktop first)
+    claude-desktop-patch-oflags --check    # read-only: print status, never write
+                                           #   already-patched | upstream-fixed |
+                                           #   needs-patch (N site(s)) | unknown-layout
+
 Re-run after every Claude Desktop update; updates replace app.asar.
 Restore with:  cp app.asar.prepatch-<stamp> app.asar
 """
@@ -31,13 +42,19 @@ import json, os, re, shutil, struct, subprocess, sys, time
 ASAR = os.environ.get("CLAUDE_DESKTOP_ASAR",
                       os.path.expanduser("~/.local/lib/claude-desktop/resources/app.asar"))
 
-# The expression as it appears, under any minified module alias.
+# The buggy expression as it appears, under any minified module alias.
 PATTERN = re.compile(
     rb"([A-Za-z_$][\w$]*)\.constants\.O_RDONLY"
     rb"\|\(\1\.constants\.O_DIRECTORY\?\?0\)"
     rb"\|\(\1\.constants\.O_NOFOLLOW\?\?0\)"
 )
 MARKER = b"/*aarch64-oflag-patch*/"
+
+# Upstream's fix (>= 1.44121): a per-arch table the app uses to correct
+# fs.constants. Its arm64 entry carries the right aarch64 values, so its
+# presence means the open() sites already receive correct flags.
+UPSTREAM_FIX = re.compile(
+    rb'"?arm64"?:\{"?O_DIRECTORY"?:16384,"?O_NOFOLLOW"?:32768\}')
 
 
 def die(msg):
@@ -60,27 +77,49 @@ def asar_entries(blob):
     return dict((p, (o, s)) for p, o, s in walk(index))
 
 
+def classify(blob):
+    """-> (state, PATTERN hits). Patch whenever the buggy expression exists;
+    only when it is absent does the upstream fix decide between a clean no-op
+    and an unrecognised layout."""
+    if MARKER in blob:
+        return "already-patched", []
+    hits = list(PATTERN.finditer(blob))
+    if hits:
+        return "needs-patch", hits
+    if UPSTREAM_FIX.search(blob):
+        return "upstream-fixed", []
+    return "unknown-layout", []
+
+
 def main():
+    check_only = "--check" in sys.argv[1:]
     if os.uname().machine not in ("aarch64", "arm64"):
         die(f"this patch is for aarch64; this machine is {os.uname().machine}")
     if not os.path.isfile(ASAR):
         die(f"app.asar not found at {ASAR}")
 
+    blob = bytearray(open(ASAR, "rb").read())
+    state, hits = classify(bytes(blob))
+
+    if check_only:
+        print(f"{state} ({len(hits)} site(s))" if hits else state)
+        sys.exit(1 if state == "unknown-layout" else 0)
+
+    if state == "already-patched":
+        print("already patched -- nothing to do")
+        return
+    if state == "upstream-fixed":
+        print("upstream fix present (per-arch fs.constants table) -- nothing to patch")
+        return
+    if state == "unknown-layout":
+        die("flag expression not found and no upstream fix detected; app layout "
+            "changed -- re-derive the patch before trusting this script")
+
+    # needs-patch: never rewrite an asar the running app has mapped.
     running = subprocess.run(["pgrep", "-f", r"lib/claude-desktop/claude-desktop$"],
                              capture_output=True).stdout.split()
     if running:
         die("Claude Desktop is running -- quit it first, then re-run this script")
-
-    blob = bytearray(open(ASAR, "rb").read())
-
-    if MARKER in blob:
-        print("already patched -- nothing to do")
-        return
-
-    hits = list(PATTERN.finditer(bytes(blob)))
-    if not hits:
-        die("flag expression not found; app layout changed -- re-derive the patch "
-            "before trusting this script")
 
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     print(f"aarch64 O_RDONLY|O_DIRECTORY|O_NOFOLLOW = {flags} "

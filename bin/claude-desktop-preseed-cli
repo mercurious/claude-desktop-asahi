@@ -8,6 +8,8 @@
 # O_DIRECTORY, and O_DIRECT on a directory is always EINVAL. The UI reports it
 # as "No path to Claude code executable (Download failed. Check your internet
 # connection and try again.)", which is misleading -- the network is fine.
+# (Upstream fixed the flag bug in >= 1.44121; preseeding stays useful because
+# it fetches the build-pinned CLI up front, e.g. before an update is applied.)
 #
 # This script does what the app would have done: reads the version + checksum
 # the installed app is pinned to, fetches that exact build, verifies it, and
@@ -26,18 +28,37 @@ case "$(uname -m)" in
 esac
 
 # Pull the build-pinned version, base URL and per-platform checksum out of the app.
+# The pin is embedded as JSON.parse('{"version":"X.Y.Z","manifest":{...},"baseUrl":...}')
+# under a minifier-renamed function whose name and quote style change between
+# builds, so anchor on the JSON's shape rather than on the code around it.
 read -r VERSION BASEURL CHECKSUM < <(ASAR="$ASAR" PLAT="$PLAT" python3 - <<'PY'
-import json, os, sys
+import json, os, re, sys
 d = open(os.environ["ASAR"], "rb").read()
-i = d.find(b"function hh(){return JSON.parse(`")
-if i < 0:
-    sys.exit("error: version pin not found in app.asar (app layout changed?)")
-s = d.find(b"`", i + 30) + 1
-o = json.loads(d[s:d.find(b"`", s)].decode("utf8"))
-p = o["manifest"]["platforms"].get(os.environ["PLAT"])
+pin = None
+for m in re.finditer(rb'\{"version":"\d+\.\d+\.\d+","manifest":\{', d):
+    depth, i = 0, m.start()
+    while i < len(d):                       # walk to this object's closing brace
+        c = d[i]
+        if c == 0x7B:
+            depth += 1
+        elif c == 0x7D:
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    try:
+        cand = json.loads(d[m.start():i + 1].decode("utf8"))
+    except ValueError:
+        continue
+    if cand.get("manifest", {}).get("platforms") and cand.get("baseUrl"):
+        pin = cand
+        break
+if pin is None:
+    sys.exit("error: Claude Code version pin not found in app.asar (app layout changed?)")
+p = pin["manifest"]["platforms"].get(os.environ["PLAT"])
 if not p:
     sys.exit(f"error: {os.environ['PLAT']} not in manifest")
-print(o["version"], o["baseUrl"], p["checksum"])
+print(pin["version"], pin["baseUrl"], p["checksum"])
 PY
 )
 

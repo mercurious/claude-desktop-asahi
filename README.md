@@ -28,6 +28,12 @@ code executable / Download failed. Check your internet connection."* The network
 flag constant is wrong for the architecture. (Reported upstream; these let you run in the
 meantime, and after each app update, which replaces `app.asar`.)
 
+**Fixed upstream in Claude Desktop ≥ 1.44121.** The app now ships a per-architecture constants
+table and corrects `fs.constants` itself when the runtime's values don't match `process.arch`.
+The tools detect this: on such builds `patch-oflags` reports `upstream-fixed` and exits 0
+without touching anything, so `claude-desktop-update` keeps working across the transition and
+older builds still get patched.
+
 ## Tools
 
 ### `bin/claude-desktop-update`
@@ -59,10 +65,13 @@ Rewrites that flag expression **in place and byte-for-byte the same length** to 
 literal for this machine — so no `app.asar` offset or size changes, and the symlink-race
 hardening (`O_DIRECTORY | O_NOFOLLOW` as *values*) is preserved. Backs up `app.asar` first, and
 zeroes the matching V8 compile-cache header so the patched source is actually used (V8 keys its
-cache check on source length). Re-run after each Claude Desktop update.
+cache check on source length). Re-run after each Claude Desktop update. On builds that already
+carry the upstream fix (≥ 1.44121) it reports `upstream-fixed` and exits 0 without writing.
 
 ```sh
 claude-desktop-patch-oflags          # quit Claude Desktop first
+claude-desktop-patch-oflags --check  # read-only status: already-patched | upstream-fixed |
+                                     #   needs-patch (N site(s)) | unknown-layout
 # restore:  cp app.asar.prepatch-<stamp> app.asar
 ```
 
