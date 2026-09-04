@@ -1,38 +1,63 @@
 # claude-desktop-asahi
 
-Fixes for **Claude Desktop for Linux (beta)** on **aarch64 / Apple Silicon (Asahi Linux)**.
+Tools for running and updating **Claude Desktop for Linux (beta)** on **aarch64 / Apple Silicon
+(Asahi Linux)** — a user-local install on Fedora, where the Linux beta has no update path of its own.
 
-Three small, self-contained tools that update, patch, or preseed **your own installed copy** of
-Claude Desktop. They do **not** redistribute any Anthropic software — `update` fetches the
-build-pinned `.deb` from Anthropic's own update feed and swaps it into your user-local install;
-`patch-oflags` edits the `app.asar` you already installed, in place; `preseed-cli` fetches the
-exact build-pinned Claude Code CLI from Anthropic's own servers with sha256 verification. No
-Anthropic code is included in this repository.
+Three small, self-contained tools that operate on **your own installed copy** of Claude Desktop.
+They do **not** redistribute any Anthropic software — `update` fetches the build-pinned `.deb`
+from Anthropic's own update feed and swaps it into your user-local install; `patch-oflags` edits
+the `app.asar` you already installed, in place; `preseed-cli` fetches the exact build-pinned
+Claude Code CLI from Anthropic's own servers with sha256 verification. No Anthropic code is
+included in this repository.
 
 > Not affiliated with or endorsed by Anthropic. Use on software you have already installed and
 > are licensed to run.
 
-## The bug these fix
+## Status — what is still needed, and what has retired
 
-Claude Desktop's private-directory helper opens directories with the **x86_64 numeric values**
-of `O_DIRECTORY` / `O_NOFOLLOW`:
+This repo began as a fix for an aarch64 bug in the app. **Anthropic fixed that bug upstream in
+Claude Desktop 1.44121 (September 2026).** That retires the patch, but not the repo: the reason
+the updater exists is unrelated to the bug, and it is still true.
+
+| Tool | Why it exists | Status on ≥ 1.44121 | Retires when |
+|---|---|---|---|
+| `claude-desktop-update` | The Linux beta's in-app updater is **off by design** (`[updater] Linux: in-app updater off (updates via apt)`), and Fedora Asahi has no apt. There is no other way to update a user-local install. | **Still essential.** Unaffected by the bug fix. | Anthropic ships a Linux update path this box can use: the in-app updater enabled on Linux, or an rpm / Flatpak / AppImage channel. Watch for that log line disappearing, or a non-`.deb` feed at `/api/desktop/linux/arm64/`. |
+| `claude-desktop-patch-oflags` | Corrected the x86_64 `O_DIRECTORY` / `O_NOFOLLOW` values the app used on aarch64 (see *History*). | **Redundant.** Detects the upstream fix, reports `upstream-fixed`, exits 0, writes nothing. | Now, for any current build. Keep it only while you might install or roll back to a pre-1.44121 build (e.g. a `claude-desktop.bak-*` taken before the fix); it still patches those. |
+| `claude-desktop-preseed-cli` | The app's own CLI downloader died on the same bug before any network I/O, so this fetched the pinned CLI for it. | **Blocker gone.** With private dirs working, the app can fetch its own CLI. Retained as a convenience: `claude-desktop-update` uses it to fetch the pinned CLI and validate the manifest *before* a swap. | Optional today. On the reference box the CLI was preseeded ahead of the 1.44121 update, so the app's own download path has not yet been exercised there. |
+
+**The repo retires completely only when the first row does** — when Anthropic provides a working
+Linux update path for this platform. Until then, the two bug-era tools are harmless no-ops that
+`claude-desktop-update` runs unconditionally, which keeps one flow working across old and new
+builds and across rollbacks.
+
+## The upstream fix (≥ 1.44121)
+
+The app now carries a per-architecture table of the two flags and corrects `fs.constants` at
+startup whenever the runtime's values don't match `process.arch`:
 
 ```js
-open(dir, O_RDONLY | (O_DIRECTORY ?? 0) | (O_NOFOLLOW ?? 0))
+S = { arm64: { O_DIRECTORY: 16384, O_NOFOLLOW: 32768 },   // 0o40000, 0o100000 — correct for aarch64
+      x64:   { O_DIRECTORY: 65536, O_NOFOLLOW: 131072 } } // 0o200000, 0o400000
 ```
 
-On aarch64, x86_64's `O_DIRECTORY` (`0o200000`) is actually **`O_DIRECT`**, and `O_DIRECT` on a
-directory always returns `EINVAL`. So every subsystem that creates a private dir fails — most
-visibly the Claude Code CLI download, which the UI reports (misleadingly) as *"No path to Claude
-code executable / Download failed. Check your internet connection."* The network is fine; the
-flag constant is wrong for the architecture. (Reported upstream; these let you run in the
-meantime, and after each app update, which replaces `app.asar`.)
+Every private-directory `open()` uses the corrected constants. On aarch64 the correction fires on
+each launch, and the app **logs it at error level and reports it to Sentry**:
 
-**Fixed upstream in Claude Desktop ≥ 1.44121.** The app now ships a per-architecture constants
-table and corrects `fs.constants` itself when the runtime's values don't match `process.arch`.
-The tools detect this: on such builds `patch-oflags` reports `upstream-fixed` and exits 0
-without touching anything, so `claude-desktop-update` keeps working across the transition and
-older builds still get patched.
+```
+[error] fs.constants open flags on arm64 carry x64/ia32's values
+        { arch: 'arm64', observedArch: 'x64/ia32',
+          expected: { O_DIRECTORY: 16384, O_NOFOLLOW: 32768 },
+          observed: { O_DIRECTORY: 65536, O_NOFOLLOW: 131072 } }      // OpenFlagAbiMismatchError
+```
+
+That line is the fix working, not a failure: the app noticed the ABI mismatch and corrected it.
+The proof is what is absent — no `EINVAL` lines, and the private-dir subsystems (CLI download,
+scheduled tasks, plugin and skills sync) all complete.
+
+The tools detect the fix by that table's presence. `claude-desktop-patch-oflags --check` prints one
+of `already-patched | upstream-fixed | needs-patch (N site(s)) | unknown-layout`; only
+`unknown-layout` is an error, and `claude-desktop-update` runs that check against the *staged*
+build before it touches your live install.
 
 ## Tools
 
@@ -41,12 +66,13 @@ One-shot updater for the whole app, so you don't have to drive the two tools bel
 Linux beta's in-app updater is off by design (it logs *"updates via apt"*), and Fedora Asahi has
 no apt — so this does what apt would: reads Anthropic's update feed, fetches the build-pinned
 `.deb` for this architecture, verifies its size, extracts it, and swaps it into your user-local
-install (`~/.local/lib/claude-desktop`). Because an update replaces `app.asar` (reverting the
-O_DIRECTORY fix) and repins the Claude Code CLI, it then re-runs `patch-oflags` and `preseed-cli`
-for you. It keeps a timestamped backup and rolls back on failure.
+install (`~/.local/lib/claude-desktop`). Before the swap it pre-validates the staged build with
+both tools below (an unrecognised layout aborts early, with the stage kept for inspection); after
+the swap it re-runs them, which on current builds is a no-op and on pre-1.44121 builds re-applies
+the patch. It keeps a timestamped backup and rolls back on failure.
 
-Quit Claude Desktop before applying — `patch-oflags` refuses while it runs, and overwriting a
-live install is unsafe. If you run it while the app is up (e.g. from a terminal the app itself
+Quit Claude Desktop before applying — `patch-oflags` refuses to rewrite a live install, and
+overwriting one is unsafe. If you run it while the app is up (e.g. from a terminal the app itself
 spawned), it stages everything and stops, so you can quit the app and finish from a fresh
 terminal with `--apply`.
 
@@ -61,12 +87,12 @@ To read the feed from `releases.claude.com` instead of `api.anthropic.com` (e.g.
 blocked), set `CLAUDE_DESKTOP_UPDATE_HOST=https://releases.claude.com`.
 
 ### `bin/claude-desktop-patch-oflags`
-Rewrites that flag expression **in place and byte-for-byte the same length** to the correct
+Rewrites the buggy flag expression **in place and byte-for-byte the same length** to the correct
 literal for this machine — so no `app.asar` offset or size changes, and the symlink-race
 hardening (`O_DIRECTORY | O_NOFOLLOW` as *values*) is preserved. Backs up `app.asar` first, and
 zeroes the matching V8 compile-cache header so the patched source is actually used (V8 keys its
-cache check on source length). Re-run after each Claude Desktop update. On builds that already
-carry the upstream fix (≥ 1.44121) it reports `upstream-fixed` and exits 0 without writing.
+cache check on source length). On builds that carry the upstream fix (≥ 1.44121) it reports
+`upstream-fixed` and exits 0 without writing.
 
 ```sh
 claude-desktop-patch-oflags          # quit Claude Desktop first
@@ -76,15 +102,35 @@ claude-desktop-patch-oflags --check  # read-only status: already-patched | upstr
 ```
 
 ### `bin/claude-desktop-preseed-cli`
-The app's own CLI downloader hits the same `O_DIRECTORY` bug before any network I/O. This does
-what the app would have: reads the version + checksum the installed app is pinned to, fetches
-that exact Claude Code build from Anthropic's server, verifies the sha256, and installs it where
-the app looks (`~/.config/Claude/claude-code/<version>/claude`). Re-run after updates.
+Before 1.44121 the app's own CLI downloader hit the `O_DIRECTORY` bug before any network I/O, so
+this did the download for it. It still does exactly what the app would: reads the version +
+checksum the installed app is pinned to, fetches that Claude Code build from Anthropic's server,
+verifies the sha256, and installs it where the app looks
+(`~/.config/Claude/claude-code/<version>/claude`). It finds the pin structurally rather than by a
+minified function name, so it survives bundler renames. Today it is a convenience:
+`claude-desktop-update` points it at a staged build to fetch the newly pinned CLI and prove the
+manifest is readable before the swap.
 
 ```sh
 claude-desktop-preseed-cli
 # then restart Claude Desktop
 ```
+
+## History: the bug (pre-1.44121)
+
+Claude Desktop's private-directory helper opened directories with the **x86_64 numeric values**
+of `O_DIRECTORY` / `O_NOFOLLOW`:
+
+```js
+open(dir, O_RDONLY | (O_DIRECTORY ?? 0) | (O_NOFOLLOW ?? 0))
+```
+
+On aarch64, x86_64's `O_DIRECTORY` (`0o200000`) is actually **`O_DIRECT`**, and `O_DIRECT` on a
+directory always returns `EINVAL`. So every subsystem that creates a private dir failed — most
+visibly the Claude Code CLI download, which the UI reported (misleadingly) as *"No path to Claude
+code executable / Download failed. Check your internet connection."* The network was fine; the
+flag constant was wrong for the architecture. It was reported upstream and fixed in 1.44121; the
+patch tool remains for anyone still on, or rolling back to, an older build.
 
 ## Install
 
