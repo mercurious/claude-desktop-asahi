@@ -149,6 +149,10 @@ also a big RAM win (the CLI is tens of MB vs. the Electron app's hundreds):
 claude --continue          # resumes the most recent conversation here
 # CLI -> Desktop: Ctrl+D, relaunch claude-desktop, reopen the same chat.
 ```
+## AI Disclosure
+
+Developed and maintained with Anthropic Claude Fable 5
+
 
 ## License
 
