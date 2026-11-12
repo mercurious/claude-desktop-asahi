@@ -15,7 +15,19 @@ included in this repository.
 
 ## Status — what is still needed, and what has retired
 
-This repo began as a fix for an aarch64 bug in the app. **Anthropic fixed that bug upstream in
+**Current state (2026-11-11, Claude Desktop 5.1231.2):**
+
+- The aarch64 bug is **fixed upstream**. The app needs no patch.
+- Anthropic **still has no Linux update path**. The app logs `[updater] Linux: in-app updater off
+  (updates via apt)`, and no official rpm, AppImage or Flatpak is published. Fedora Asahi has no
+  apt, so something still has to fetch and swap in new builds.
+- A third-party **signed DNF repo** keeps the app current with `sudo dnf upgrade` (see
+  [below](#alternative-the-third-party-dnf-repo)).
+
+The repo's remaining job is `claude-desktop-update`, which keeps a user-local install current with
+Anthropic's own bytes. The patch tool does nothing on current builds.
+
+History: this repo began as a fix for an aarch64 bug in the app. **Anthropic fixed that bug upstream in
 Claude Desktop 1.44121 (September 2026)**, which retired the patch. Then
 [#1](https://github.com/mercurious/claude-desktop-asahi/issues/1) pointed out what retires most of
 the rest: a third-party project already publishes a **signed DNF repo carrying aarch64 packages**,
@@ -31,8 +43,8 @@ the option you pick when that distinction matters to you, not the only road out.
 
 | Tool | Why it exists | Status | Retires when |
 |---|---|---|---|
-| `claude-desktop-update` | Anthropic still ships no Linux update path — 2.2553.1 still logs `[updater] Linux: in-app updater off (updates via apt)`, and Fedora Asahi has no apt. This fetches **Anthropic's own** build-pinned `.deb`, into a user-local install, with a timestamped backup and rollback. | **Optional — no longer the only option.** A third-party DNF repo now covers the same gap. Keep this if you want unmodified Anthropic bytes, a user-local (non-root) install, or a rollback you control. | Anthropic ships a Linux update path this box can use (in-app updater enabled on Linux, or an official rpm / Flatpak / AppImage channel) — **or** you accept the third-party repackage and move to `dnf`. |
-| `claude-desktop-patch-oflags` | Corrected the x86_64 `O_DIRECTORY` / `O_NOFOLLOW` values the app used on aarch64 (see *History*). | **Redundant.** Detects the upstream fix, reports `upstream-fixed`, exits 0, writes nothing — confirmed against 2.2553.1. | Now, for any current build. Keep it only while you might install or roll back to a pre-1.44121 build (e.g. a `claude-desktop.bak-*` taken before the fix); it still patches those. |
+| `claude-desktop-update` | Anthropic still ships no Linux update path — 5.1231.2 still logs `[updater] Linux: in-app updater off (updates via apt)`, and Fedora Asahi has no apt. This fetches **Anthropic's own** build-pinned `.deb`, into a user-local install, with a timestamped backup and rollback. | **Useful — the only tool here with a job on current builds.** A third-party DNF repo covers the same gap, but this is the option that keeps Anthropic's unmodified bytes in a user-local (non-root) install, with a rollback you control. | Anthropic ships a Linux update path this box can use (in-app updater enabled on Linux, or an official rpm / Flatpak / AppImage channel) — **or** you accept the third-party repackage and move to `dnf`. |
+| `claude-desktop-patch-oflags` | Corrected the x86_64 `O_DIRECTORY` / `O_NOFOLLOW` values the app used on aarch64 (see *History*). | **Retired for current builds.** Detects the upstream fix, reports `upstream-fixed`, exits 0, writes nothing — confirmed against 5.1231.2. | Now, for any current build. Keep it only while you might install or roll back to a pre-1.44121 build (e.g. a `claude-desktop.bak-*` taken before the fix); it still patches those. |
 | `claude-desktop-preseed-cli` | The app's own CLI downloader died on the same bug before any network I/O, so this fetched the pinned CLI for it. | **Blocker gone.** Retained as a convenience: `claude-desktop-update` uses it to fetch the pinned CLI and validate the manifest *before* a swap. | Optional today. |
 
 **What would retire the repo completely:** switching this box to the DNF repo. All three tools
@@ -117,7 +129,7 @@ The proof is what is absent — no `EINVAL` lines, and the private-dir subsystem
 scheduled tasks, plugin and skills sync) all complete.
 
 **It has since gone quiet.** On this box the line appeared on five of eight 1.44121.4 launches
-(2026-09-03 to 09-07) and has not appeared since — not on 1.49585.0, 1.52386.x, or 2.2553.1. The
+(2026-09-03 to 09-07) and has not appeared since — not on 1.49585.0, 1.52386.x, 2.2553.1, or 5.1231.2. The
 guard is still in the bundle (`OpenFlagAbiMismatchError` is present in every build checked), so it
 isn't that upstream removed it: the runtime simply stopped reporting x64 constants on arm64, and
 there is nothing left to correct. Both layers of the fix now hold, and a silent log is the
@@ -224,8 +236,8 @@ claude --continue          # resumes the most recent conversation here
 ```
 ## AI Disclosure
 
-Developed and maintained with Anthropic Claude — Fable 5, and Opus 5 for the 2026-09-19 DNF-repo
-verification and README revision.
+Developed and maintained with Anthropic Claude — Fable 5, Opus 5 for the 2026-09-19 DNF-repo
+verification and README revision, and Haiku 5.5 for the 2026-11-11 status update.
 
 
 ## License
