@@ -1,4 +1,10 @@
-# claude-desktop-asahi
+# claude-desktop-asahi (updater only)
+
+> [!IMPORTANT]
+>  Use this tool to update Claude Code Desktop on Asahi Linux until an official update path arrives.<br>
+>  `claude-desktop-update`<br>
+>  **All other features and uses retired.**
+> 
 
 Tools for running and updating **Claude Desktop for Linux (beta)** on **aarch64 / Apple Silicon
 (Asahi Linux)** — a user-local install on Fedora, where the Linux beta has no update path of its own.
